@@ -1,6 +1,7 @@
 package com.example.randomblockmod.events;
 
 import com.example.randomblockmod.RandomBlockMod;
+import com.example.randomblockmod.data.ReplacedChunksSavedData;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.server.level.ServerLevel;
@@ -22,8 +23,14 @@ import java.util.*;
 
 /**
  * Handles chunk replacement when a player moves into a new chunk.
- * Uses direct LevelChunkSection manipulation for performance,
- * then sends a full chunk packet to clients.
+ *
+ * Rules:
+ *  1. Air blocks in the chunk are NEVER replaced — only solid/non-air blocks.
+ *  2. Each chunk is replaced at most ONCE per dimension; the set of replaced
+ *     chunks is persisted via SavedData so it survives server restarts.
+ *
+ * Uses direct LevelChunkSection manipulation for performance, then sends
+ * a single full chunk packet to clients instead of ~98 k block-change packets.
  */
 @Mod.EventBusSubscriber(modid = RandomBlockMod.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class ChunkReplaceHandler {
@@ -33,7 +40,7 @@ public class ChunkReplaceHandler {
     /** Tracks each player's last known chunk (packed long key). */
     private static final Map<UUID, Long> playerLastChunk = new HashMap<>();
 
-    /** Lazily-built list of all usable blocks. */
+    /** Lazily-built, immutable list of all usable blocks. */
     private static volatile List<Block> blockList = null;
 
     // -----------------------------------------------------------------------
@@ -93,42 +100,69 @@ public class ChunkReplaceHandler {
     // -----------------------------------------------------------------------
 
     private static void replaceChunk(ServerLevel level, int chunkX, int chunkZ) {
+        long chunkKey = packChunkKey(chunkX, chunkZ);
+
+        // Guard: skip chunks that were already replaced in this or a previous session.
+        ReplacedChunksSavedData savedData = ReplacedChunksSavedData.get(level);
+        if (savedData.isReplaced(chunkKey)) {
+            LOGGER.debug("[RandomBlockMod] Chunk ({}, {}) already replaced — skipping", chunkX, chunkZ);
+            return;
+        }
+
         List<Block> blocks = getBlockList();
         if (blocks.isEmpty()) return;
 
         // Pick a random block
         Block chosen = blocks.get(level.random.nextInt(blocks.size()));
-        BlockState state = chosen.defaultBlockState();
+        BlockState newState = chosen.defaultBlockState();
 
-        LOGGER.info("[RandomBlockMod] Replacing chunk ({}, {}) with '{}'",
+        LOGGER.info("[RandomBlockMod] Replacing non-air blocks in chunk ({}, {}) with '{}'",
                 chunkX, chunkZ, ForgeRegistries.BLOCKS.getKey(chosen));
 
         LevelChunk chunk = level.getChunk(chunkX, chunkZ);
 
-        // Remove any existing block entities to avoid stale TileEntity data
+        // Remove existing block entities (chests, furnaces, etc.) whose blocks
+        // are about to be overwritten. Air positions never have block entities,
+        // so this is safe regardless of the air-skip logic below.
         new ArrayList<>(chunk.getBlockEntities().keySet())
                 .forEach(chunk::removeBlockEntity);
 
-        // Fill every chunk section (16×16×16 sub-volume) with the chosen block.
-        // Direct section access is orders of magnitude faster than level.setBlock()
-        // for bulk operations since it bypasses per-block lighting/neighbor updates.
+        // Iterate every chunk section (16×16×16 sub-volume).
+        // Only overwrite positions that currently hold a non-air block, so
+        // caves, open sky above terrain, etc. remain empty.
+        boolean anyChanged = false;
         LevelChunkSection[] sections = chunk.getSections();
         for (LevelChunkSection section : sections) {
+            boolean sectionChanged = false;
             for (int lx = 0; lx < 16; lx++) {
                 for (int ly = 0; ly < 16; ly++) {
                     for (int lz = 0; lz < 16; lz++) {
-                        section.setBlockState(lx, ly, lz, state, false);
+                        if (!section.getBlockState(lx, ly, lz).isAir()) {
+                            section.setBlockState(lx, ly, lz, newState, false);
+                            sectionChanged = true;
+                        }
                     }
                 }
             }
-            // Recalculate non-empty / ticking block counts for this section
-            section.recalcBlockCounts();
+            if (sectionChanged) {
+                // Recalculate non-empty / ticking block counts for this section
+                section.recalcBlockCounts();
+                anyChanged = true;
+            }
+        }
+
+        // Mark the chunk as replaced regardless of whether any blocks changed
+        // (e.g. a fully-air chunk above build height), so we never revisit it.
+        savedData.markReplaced(chunkKey);
+
+        if (!anyChanged) {
+            return; // Nothing to resend to clients
         }
 
         chunk.setUnsaved(true);
 
         // Trigger lighting recalculation at the four corners of each section row.
-        // The light engine will propagate updates from these sample points.
+        // The light engine propagates updates asynchronously from these sample points.
         int baseX = chunkX * 16;
         int baseZ = chunkZ * 16;
         BlockPos.MutableBlockPos lp = new BlockPos.MutableBlockPos();
@@ -158,7 +192,7 @@ public class ChunkReplaceHandler {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /** Packs two chunk coordinates into a single long for efficient map keying. */
+    /** Packs two chunk coordinates into a single long for efficient map/set keying. */
     private static long packChunkKey(int x, int z) {
         return ((long) x & 0xFFFFFFFFL) | (((long) z & 0xFFFFFFFFL) << 32);
     }
