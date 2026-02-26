@@ -1,0 +1,25 @@
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# IntelliJ IDEA
+out/
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Runtime
+run/
+run-data/
+mcmodsrepo/
+
+# Mod dev
+src/generated/
