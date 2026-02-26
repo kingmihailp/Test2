@@ -62,13 +62,14 @@ public class ReplacedChunksSavedData extends SavedData {
      * Retrieves (or creates) the saved-data instance for the given server level.
      * Data is stored per-dimension, so Overworld / Nether / End are tracked separately.
      */
+    /**
+     * In Forge 47.x the signature is:
+     *   computeIfAbsent(Function<CompoundTag, T> deserializer, Supplier<T> constructor, String name)
+     */
     public static ReplacedChunksSavedData get(ServerLevel level) {
         return level.getDataStorage().computeIfAbsent(
-                new SavedData.Factory<>(
-                        ReplacedChunksSavedData::new,
-                        ReplacedChunksSavedData::load,
-                        null
-                ),
+                ReplacedChunksSavedData::load,
+                ReplacedChunksSavedData::new,
                 DATA_NAME
         );
     }
